@@ -141,6 +141,10 @@ STUDENT_DASHBOARD_HTML = """
                     {% endif %}
                 </td>
             </tr>
+            {% empty %}
+            <tr>
+                <td colspan="5" style="text-align: center;">No fee records available. Contact Teacher.</td>
+            </tr>
             {% endfor %}
         </table>
 
@@ -216,7 +220,7 @@ ADMIN_DASHBOARD_HTML = """
         <div class="form-box" style="background: #eaf4ff; border-color: #b8daff;">
             <h3>Configure Your Payment UPI ID</h3>
             <form action="/update-upi" method="POST" style="display: flex; gap: 10px; align-items: center;">
-                <input type="text" name="upi_id" value="{{ config.upi_id }}" placeholder="e.g. yourname@upi" style="width: 250px;" required>
+                <input type="text" name="upi_id" value="{{ config.upi_id if config else 'teacher@upi' }}" placeholder="e.g. yourname@upi" style="width: 250px;" required>
                 <button type="submit" style="background: #28a745;">Save UPI ID</button>
             </form>
         </div>
@@ -240,6 +244,8 @@ ADMIN_DASHBOARD_HTML = """
                     {% for rec in student.fee_records %}
                         <small><b>{{ rec.month }}:</b> 
                         {% if rec.is_paid %}<span class="status-paid">PAID</span>{% else %}<span class="status-unpaid">UNPAID</span>{% endif %}</small><br>
+                    {% empty %}
+                        <small style="color:gray;">No fee record</small>
                     {% endfor %}
                 </td>
                 <td>
@@ -298,6 +304,14 @@ def login():
             login_user(user)
             if user.role == 'admin':
                 return redirect(url_for('admin_dashboard'))
+            
+            # Ensure the student has at least one initial fee record if missing
+            if not user.fee_records:
+                curr_month = datetime.now().strftime('%B %Y')
+                rec = FeeRecord(user_id=user.id, month=curr_month, amount=user.monthly_fee, is_paid=False)
+                db.session.add(rec)
+                db.session.commit()
+
             return redirect(url_for('student_dashboard'))
         
         flash('Invalid Email or Password!')
@@ -308,9 +322,18 @@ def login():
 def student_dashboard():
     if current_user.role == 'admin':
         return redirect(url_for('admin_dashboard'))
+    
+    # Safely create initial record if student history is empty
+    if not current_user.fee_records:
+        curr_month = datetime.now().strftime('%B %Y')
+        rec = FeeRecord(user_id=current_user.id, month=curr_month, amount=current_user.monthly_fee, is_paid=False)
+        db.session.add(rec)
+        db.session.commit()
+
     materials = StudyMaterial.query.all()
     config = SystemConfig.query.first()
-    return render_template_string(STUDENT_DASHBOARD_HTML, materials=materials, upi_id=config.upi_id)
+    upi_str = config.upi_id if config else "teacher@upi"
+    return render_template_string(STUDENT_DASHBOARD_HTML, materials=materials, upi_id=upi_str)
 
 @app.route('/admin-dashboard')
 @login_required
@@ -326,6 +349,9 @@ def admin_dashboard():
 def update_upi():
     if current_user.role == 'admin':
         config = SystemConfig.query.first()
+        if not config:
+            config = SystemConfig(upi_id='teacher@upi')
+            db.session.add(config)
         config.upi_id = request.form.get('upi_id')
         db.session.commit()
     return redirect(url_for('admin_dashboard'))
