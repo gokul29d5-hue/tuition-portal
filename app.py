@@ -1,15 +1,18 @@
 import os
 import io
+import hmac
+import hashlib
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, flash, send_file
+from flask import Flask, render_template_string, request, redirect, url_for, flash, send_file, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+import razorpay
 from reportlab.pdfgen import canvas
 
 app = Flask(__name__)
 
-# Production configuration & safe temp database location for Render
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'default_fallback_secret_key_123')
+# Secret keys and database path configuration
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'production_super_secret_key_98765')
 db_path = os.path.join('/tmp', 'tuition_system.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -17,6 +20,11 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
+
+# Razorpay API Credentials (Set via environment variables or replace with test keys)
+RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', 'rzp_test_YOUR_KEY_ID')
+RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', 'YOUR_KEY_SECRET')
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 # ==========================================
 # 1. DATABASE MODELS
@@ -27,7 +35,7 @@ class User(UserMixin, db.Model):
     email = db.Column(db.String(100), unique=True, nullable=False)
     password = db.Column(db.String(100), nullable=False)
     name = db.Column(db.String(100), nullable=False)
-    role = db.Column(db.String(20), default='student')
+    role = db.Column(db.String(20), default='student')  # 'admin' or 'student'
     monthly_fee = db.Column(db.Integer, default=1500)
     fee_records = db.relationship('FeeRecord', backref='student', lazy=True, cascade="all, delete-orphan")
 
@@ -38,15 +46,13 @@ class FeeRecord(db.Model):
     amount = db.Column(db.Integer, nullable=False)
     is_paid = db.Column(db.Boolean, default=False)
     payment_date = db.Column(db.String(50), default='-')
+    razorpay_order_id = db.Column(db.String(100), nullable=True)
+    razorpay_payment_id = db.Column(db.String(100), nullable=True)
 
 class StudyMaterial(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(200), nullable=False)
     file_type = db.Column(db.String(50), nullable=False)
-
-class SystemConfig(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    upi_id = db.Column(db.String(100), default='teacher@upi')
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -92,20 +98,18 @@ STUDENT_DASHBOARD_HTML = """
 <head>
     <title>Student Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; background: #fafafa; }
         .container { max-width: 850px; margin: auto; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         .badge-paid { color: green; font-weight: bold; background: #e6ffe6; padding: 5px 10px; border-radius: 4px; }
         .badge-unpaid { color: red; font-weight: bold; background: #ffe6e6; padding: 5px 10px; border-radius: 4px; }
         .btn { padding: 8px 15px; background: #007bff; color: white; text-decoration: none; border-radius: 4px; display: inline-block; cursor: pointer; border: none; }
-        .btn-pay { background: #28a745; }
+        .btn-pay { background: #28a745; font-weight: bold; }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 15px; }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
         th { background: #f8f9fa; }
-        .modal { display: none; position: fixed; z-index: 10; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }
-        .modal-content { background: white; margin: 10% auto; padding: 25px; border-radius: 8px; width: 330px; text-align: center; }
-        .qr-img { border: 2px solid #ddd; padding: 10px; border-radius: 8px; margin: 15px 0; }
     </style>
 </head>
 <body>
@@ -115,7 +119,7 @@ STUDENT_DASHBOARD_HTML = """
             <a href="/logout" style="color: red; text-decoration: none; font-weight: bold;">Log Out</a>
         </div>
 
-        <h3>Monthly Fee Status & History Chart</h3>
+        <h3>Monthly Fee Payment Status</h3>
         <table>
             <tr>
                 <th>Month</th>
@@ -138,15 +142,15 @@ STUDENT_DASHBOARD_HTML = """
                 <td>{{ record.payment_date }}</td>
                 <td>
                     {% if record.is_paid %}
-                        <a href="/download-receipt/{{ record.id }}" class="btn">Download Receipt (PDF)</a>
+                        <a href="/download-receipt/{{ record.id }}" class="btn">Download PDF Receipt</a>
                     {% else %}
-                        <button class="btn btn-pay" onclick="openPaymentModal({{ record.id }}, '{{ record.month }}', {{ record.amount }})">Pay Fee via QR</button>
+                        <button class="btn btn-pay" onclick="initiatePayment({{ record.id }})">Pay Fee Online</button>
                     {% endif %}
                 </td>
             </tr>
             {% else %}
             <tr>
-                <td colspan="5" style="text-align: center;">No fee records available. Contact Teacher.</td>
+                <td colspan="5" style="text-align: center;">No fee records assigned by Admin yet.</td>
             </tr>
             {% endfor %}
         </table>
@@ -161,32 +165,61 @@ STUDENT_DASHBOARD_HTML = """
         </ul>
     </div>
 
-    <div id="payModal" class="modal">
-        <div class="modal-content">
-            <h3>Scan QR Code to Pay</h3>
-            <p>Paying for: <b id="payMonth"></b></p>
-            <p>Fee Allocated: <b id="payAmount"></b></p>
-            <img id="qrImage" class="qr-img" src="" alt="UPI QR Code" width="200" height="200">
-            <p><small>Scan with Google Pay, PhonePe, or Paytm</small></p>
-            <form action="/pay-fee" method="POST">
-                <input type="hidden" id="recordId" name="record_id">
-                <button type="submit" class="btn btn-pay" style="width: 100%;">I Have Completed Payment</button>
-            </form>
-            <button onclick="closePaymentModal()" style="margin-top: 10px; background: none; border: none; color: gray; cursor: pointer;">Cancel</button>
-        </div>
-    </div>
-
     <script>
-        function openPaymentModal(recId, month, amount) {
-            document.getElementById('payMonth').innerText = month;
-            document.getElementById('payAmount').innerText = 'Rs. ' + amount;
-            document.getElementById('recordId').value = recId;
-            var upiId = "{{ upi_id }}";
-            var qrUrl = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=upi://pay?pa=" + encodeURIComponent(upiId) + "%26pn=TuitionFee%26am=" + amount + "%26cu=INR";
-            document.getElementById('qrImage').src = qrUrl;
-            document.getElementById('payModal').style.display = 'block';
+        function initiatePayment(recordId) {
+            fetch('/create-razorpay-order', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'record_id=' + recordId
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                var options = {
+                    "key": data.key_id,
+                    "amount": data.amount,
+                    "currency": "INR",
+                    "name": "Tuition Fee Payment",
+                    "description": "Fee for " + data.month,
+                    "order_id": data.order_id,
+                    "handler": function (response) {
+                        verifyPayment(response, recordId);
+                    },
+                    "prefill": {
+                        "name": "{{ current_user.name }}",
+                        "email": "{{ current_user.email }}"
+                    },
+                    "theme": { "color": "#28a745" }
+                };
+                var rzp1 = new Razorpay(options);
+                rzp1.open();
+            });
         }
-        function closePaymentModal() { document.getElementById('payModal').style.display = 'none'; }
+
+        function verifyPayment(paymentResponse, recordId) {
+            fetch('/verify-payment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    razorpay_order_id: paymentResponse.razorpay_order_id,
+                    razorpay_payment_id: paymentResponse.razorpay_payment_id,
+                    razorpay_signature: paymentResponse.razorpay_signature,
+                    record_id: recordId
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    alert('Payment Verified Successfully!');
+                    window.location.reload();
+                } else {
+                    alert('Payment Verification Failed!');
+                }
+            });
+        }
     </script>
 </body>
 </html>
@@ -200,7 +233,7 @@ ADMIN_DASHBOARD_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; background: #f4f7f6; }
-        .container { max-width: 1000px; margin: auto; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .container { max-width: 1050px; margin: auto; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 15px; }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
@@ -209,8 +242,8 @@ ADMIN_DASHBOARD_HTML = """
         input { padding: 8px; margin: 5px 0; }
         button { padding: 8px 12px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
         .btn-delete { background: #dc3545; }
-        .status-paid { color: green; font-weight: bold; }
-        .status-unpaid { color: red; font-weight: bold; }
+        .status-paid { color: green; font-weight: bold; background: #e6ffe6; padding: 3px 6px; border-radius: 3px; }
+        .status-unpaid { color: red; font-weight: bold; background: #ffe6e6; padding: 3px 6px; border-radius: 3px; }
     </style>
 </head>
 <body>
@@ -220,46 +253,44 @@ ADMIN_DASHBOARD_HTML = """
             <a href="/logout" style="color: red; text-decoration: none; font-weight: bold;">Log Out</a>
         </div>
 
-        <div class="form-box" style="background: #eaf4ff; border-color: #b8daff;">
-            <h3>Configure Your Payment UPI ID</h3>
-            <form action="/update-upi" method="POST" style="display: flex; gap: 10px; align-items: center;">
-                <input type="text" name="upi_id" value="{{ config.upi_id if config else 'teacher@upi' }}" placeholder="e.g. yourname@upi" style="width: 250px;" required>
-                <button type="submit" style="background: #28a745;">Save UPI ID</button>
-            </form>
-        </div>
-
-        <h3>Live Student Fee Management & Monthly Charts</h3>
+        <h3>Monthly Fee Monitoring & Student Allocation</h3>
         <table>
             <tr>
                 <th>Student Name</th>
                 <th>Email</th>
-                <th>Current Fee</th>
-                <th>Fee History Tracking</th>
-                <th>Edit Fee</th>
+                <th>Current Assigned Fee</th>
+                <th>Monthly Payment Audit Trail</th>
+                <th>Assign New Fee</th>
                 <th>Action</th>
             </tr>
             {% for student in students %}
             <tr>
                 <td><b>{{ student.name }}</b></td>
                 <td>{{ student.email }}</td>
-                <td>Rs. {{ student.monthly_fee }}</td>
+                <td><b>Rs. {{ student.monthly_fee }}</b></td>
                 <td>
                     {% for rec in student.fee_records %}
-                        <small><b>{{ rec.month }}:</b> 
-                        {% if rec.is_paid %}<span class="status-paid">PAID</span>{% else %}<span class="status-unpaid">UNPAID</span>{% endif %}</small><br>
+                        <div style="margin-bottom: 5px;">
+                            <b>{{ rec.month }}:</b>
+                            {% if rec.is_paid %}
+                                <span class="status-paid">PAID (Rs. {{ rec.amount }})</span>
+                            {% else %}
+                                <span class="status-unpaid">UNPAID (Rs. {{ rec.amount }})</span>
+                            {% endif %}
+                        </div>
                     {% else %}
-                        <small style="color:gray;">No fee record</small>
+                        <small style="color:gray;">No fee record created</small>
                     {% endfor %}
                 </td>
                 <td>
                     <form action="/update-fee" method="POST" style="display:inline;">
                         <input type="hidden" name="user_id" value="{{ student.id }}">
-                        <input type="number" name="new_fee" placeholder="New Fee" style="width: 80px;" required>
-                        <button type="submit">Update</button>
+                        <input type="number" name="new_fee" placeholder="Fee (Rs.)" style="width: 80px;" required>
+                        <button type="submit">Update Fee</button>
                     </form>
                 </td>
                 <td>
-                    <form action="/delete-student" method="POST" style="display:inline;" onsubmit="return confirm('Are you sure you want to delete this student?');">
+                    <form action="/delete-student" method="POST" style="display:inline;" onsubmit="return confirm('Delete this student?');">
                         <input type="hidden" name="user_id" value="{{ student.id }}">
                         <button type="submit" class="btn-delete">Delete</button>
                     </form>
@@ -273,18 +304,18 @@ ADMIN_DASHBOARD_HTML = """
             <form action="/add-student" method="POST">
                 <input type="text" name="name" placeholder="Student Name" required>
                 <input type="email" name="email" placeholder="Gmail Address" required>
-                <input type="number" name="fee" placeholder="Monthly Fee (Rs.)" required>
+                <input type="number" name="fee" placeholder="Initial Fee (Rs.)" required>
                 <input type="password" name="password" placeholder="Assign Password" required>
-                <button type="submit" style="background: #28a745;">Add Student</button>
+                <button type="submit" style="background: #28a745;">Create Student Account</button>
             </form>
         </div>
 
         <div class="form-box">
-            <h3>Upload Homework / Study Materials</h3>
+            <h3>Post Homework / Classroom Material</h3>
             <form action="/add-material" method="POST">
                 <input type="text" name="title" placeholder="Material Title" required>
                 <input type="text" name="type" placeholder="Type (PDF, Image, Notes)" required>
-                <button type="submit">Post Material</button>
+                <button type="submit">Publish Material</button>
             </form>
         </div>
     </div>
@@ -298,14 +329,11 @@ ADMIN_DASHBOARD_HTML = """
 
 @app.before_request
 def setup_db():
-    # Automatically initialize tables and default accounts before processing requests
     db.create_all()
-    if not SystemConfig.query.first():
-        db.session.add(SystemConfig(upi_id='teacher@upi'))
     if not User.query.filter_by(email='admin@tuition.com').first():
         admin = User(email='admin@tuition.com', password='admin123', name='Teacher Admin', role='admin')
         db.session.add(admin)
-    db.session.commit()
+        db.session.commit()
 
 @app.route('/', methods=['GET', 'POST'])
 def login():
@@ -318,13 +346,6 @@ def login():
             login_user(user)
             if user.role == 'admin':
                 return redirect(url_for('admin_dashboard'))
-            
-            if not user.fee_records:
-                curr_month = datetime.now().strftime('%B %Y')
-                rec = FeeRecord(user_id=user.id, month=curr_month, amount=user.monthly_fee, is_paid=False)
-                db.session.add(rec)
-                db.session.commit()
-
             return redirect(url_for('student_dashboard'))
         
         flash('Invalid Email or Password!')
@@ -343,9 +364,7 @@ def student_dashboard():
         db.session.commit()
 
     materials = StudyMaterial.query.all()
-    config = SystemConfig.query.first()
-    upi_str = config.upi_id if config else "teacher@upi"
-    return render_template_string(STUDENT_DASHBOARD_HTML, materials=materials, upi_id=upi_str)
+    return render_template_string(STUDENT_DASHBOARD_HTML, materials=materials)
 
 @app.route('/admin-dashboard')
 @login_required
@@ -353,31 +372,7 @@ def admin_dashboard():
     if current_user.role != 'admin':
         return redirect(url_for('student_dashboard'))
     students = User.query.filter_by(role='student').all()
-    config = SystemConfig.query.first()
-    return render_template_string(ADMIN_DASHBOARD_HTML, students=students, config=config)
-
-@app.route('/update-upi', methods=['POST'])
-@login_required
-def update_upi():
-    if current_user.role == 'admin':
-        config = SystemConfig.query.first()
-        if not config:
-            config = SystemConfig(upi_id='teacher@upi')
-            db.session.add(config)
-        config.upi_id = request.form.get('upi_id')
-        db.session.commit()
-    return redirect(url_for('admin_dashboard'))
-
-@app.route('/pay-fee', methods=['POST'])
-@login_required
-def pay_fee():
-    rec_id = request.form.get('record_id')
-    record = FeeRecord.query.get(rec_id)
-    if record and record.user_id == current_user.id:
-        record.is_paid = True
-        record.payment_date = datetime.now().strftime('%d-%b-%Y')
-        db.session.commit()
-    return redirect(url_for('student_dashboard'))
+    return render_template_string(ADMIN_DASHBOARD_HTML, students=students)
 
 @app.route('/update-fee', methods=['POST'])
 @login_required
@@ -387,6 +382,7 @@ def update_fee():
         new_fee = int(request.form.get('new_fee'))
         if user:
             user.monthly_fee = new_fee
+            # Update the fee amount for all current unpaid records instantly
             for rec in user.fee_records:
                 if not rec.is_paid:
                     rec.amount = new_fee
@@ -432,26 +428,85 @@ def add_material():
         db.session.commit()
     return redirect(url_for('admin_dashboard'))
 
+# ==========================================
+# 4. PAYMENT & VERIFICATION ENGINE
+# ==========================================
+
+@app.route('/create-razorpay-order', methods=['POST'])
+@login_required
+def create_razorpay_order():
+    rec_id = request.form.get('record_id')
+    record = FeeRecord.query.get_or_404(rec_id)
+    
+    if record.user_id != current_user.id or record.is_paid:
+        return jsonify({'error': 'Invalid fee record'}), 400
+
+    order_amount = record.amount * 100  # Convert to Paise
+    order_data = {
+        'amount': order_amount,
+        'currency': 'INR',
+        'receipt': f'rcpt_{record.id}',
+        'payment_capture': '1'
+    }
+    
+    order = razorpay_client.order.create(data=order_data)
+    record.razorpay_order_id = order['id']
+    db.session.commit()
+
+    return jsonify({
+        'order_id': order['id'],
+        'amount': order_amount,
+        'key_id': RAZORPAY_KEY_ID,
+        'month': record.month
+    })
+
+@app.route('/verify-payment', methods=['POST'])
+@login_required
+def verify_payment():
+    data = request.get_json()
+    record = FeeRecord.query.get_or_404(data['record_id'])
+
+    params_dict = {
+        'razorpay_order_id': data['razorpay_order_id'],
+        'razorpay_payment_id': data['razorpay_payment_id'],
+        'razorpay_signature': data['razorpay_signature']
+    }
+
+    try:
+        razorpay_client.utility.verify_payment_signature(params_dict)
+        record.is_paid = True
+        record.payment_date = datetime.now().strftime('%d-%b-%Y')
+        record.razorpay_payment_id = data['razorpay_payment_id']
+        db.session.commit()
+        return jsonify({'status': 'success'})
+    except razorpay.errors.SignatureVerificationError:
+        return jsonify({'status': 'failure'}), 400
+
 @app.route('/download-receipt/<int:record_id>')
 @login_required
 def download_receipt(record_id):
     rec = FeeRecord.query.get_or_404(record_id)
     if rec.user_id != current_user.id or not rec.is_paid:
-        return "Unauthorized", 403
+        return "Unauthorized action.", 403
         
     buffer = io.BytesIO()
     p = canvas.Canvas(buffer)
+    
     p.setFont("Helvetica-Bold", 18)
-    p.drawString(200, 800, "OFFICIAL TUITION RECEIPT")
+    p.drawString(180, 800, "OFFICIAL TUITION FEE RECEIPT")
     p.line(100, 780, 500, 780)
+    
     p.setFont("Helvetica", 12)
     p.drawString(100, 740, f"Receipt Date: {rec.payment_date}")
-    p.drawString(100, 710, f"Student Name: {current_user.name}")
-    p.drawString(100, 680, f"Fee Month: {rec.month}")
-    p.drawString(100, 650, f"Amount Paid: Rs. {rec.amount}")
-    p.drawString(100, 620, "Status: PAID (Verified Online)")
+    p.drawString(100, 710, f"Transaction ID: {rec.razorpay_payment_id or 'TXN_VERIFIED'}")
+    p.drawString(100, 680, f"Student Name: {current_user.name}")
+    p.drawString(100, 650, f"Fee Period: {rec.month}")
+    p.drawString(100, 620, f"Amount Paid: Rs. {rec.amount}")
+    p.drawString(100, 590, "Payment Method: Razorpay Online (Verified)")
+    
     p.showPage()
     p.save()
+    
     buffer.seek(0)
     return send_file(buffer, as_attachment=True, download_name=f"Receipt_{current_user.name}_{rec.month}.pdf", mimetype='application/pdf')
 
