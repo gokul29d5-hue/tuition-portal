@@ -2,4 +2,5 @@ Flask
 Flask-SQLAlchemy
 Flask-Login
 reportlab
+razorpay
 gunicorn
