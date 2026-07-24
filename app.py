@@ -7,8 +7,11 @@ from flask_login import LoginManager, UserMixin, login_user, logout_user, login_
 from reportlab.pdfgen import canvas
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'production_super_secret_key_98765'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///tuition_system.db'
+
+# Production configuration & safe temp database location for Render
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'default_fallback_secret_key_123')
+db_path = os.path.join('/tmp', 'tuition_system.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -16,7 +19,7 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
 # ==========================================
-# 1. PERMANENT DATABASE MODELS
+# 1. DATABASE MODELS
 # ==========================================
 
 class User(UserMixin, db.Model):
@@ -24,7 +27,7 @@ class User(UserMixin, db.Model):
     email = db.Column(db.String(100), unique=True, nullable=False)
     password = db.Column(db.String(100), nullable=False)
     name = db.Column(db.String(100), nullable=False)
-    role = db.Column(db.String(20), default='student')  # 'admin' or 'student'
+    role = db.Column(db.String(20), default='student')
     monthly_fee = db.Column(db.Integer, default=1500)
     fee_records = db.relationship('FeeRecord', backref='student', lazy=True, cascade="all, delete-orphan")
 
@@ -50,14 +53,14 @@ def load_user(user_id):
     return User.query.get(int(user_id))
 
 # ==========================================
-# 2. HTML WEBPAGE TEMPLATES
+# 2. HTML TEMPLATES
 # ==========================================
 
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Tuition Portal</title>
+    <title>Tuition Portal Login</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         body { font-family: Arial, sans-serif; background: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
@@ -141,7 +144,7 @@ STUDENT_DASHBOARD_HTML = """
                     {% endif %}
                 </td>
             </tr>
-            {% empty %}
+            {% else %}
             <tr>
                 <td colspan="5" style="text-align: center;">No fee records available. Contact Teacher.</td>
             </tr>
@@ -152,7 +155,7 @@ STUDENT_DASHBOARD_HTML = """
         <ul>
             {% for item in materials %}
                 <li><b>{{ item.title }}</b> - <i>[{{ item.file_type }}]</i></li>
-            {% empty %}
+            {% else %}
                 <li>No materials posted yet.</li>
             {% endfor %}
         </ul>
@@ -244,7 +247,7 @@ ADMIN_DASHBOARD_HTML = """
                     {% for rec in student.fee_records %}
                         <small><b>{{ rec.month }}:</b> 
                         {% if rec.is_paid %}<span class="status-paid">PAID</span>{% else %}<span class="status-unpaid">UNPAID</span>{% endif %}</small><br>
-                    {% empty %}
+                    {% else %}
                         <small style="color:gray;">No fee record</small>
                     {% endfor %}
                 </td>
@@ -290,8 +293,19 @@ ADMIN_DASHBOARD_HTML = """
 """
 
 # ==========================================
-# 3. CONTROLLER ROUTES
+# 3. ROUTES & CONTROLLERS
 # ==========================================
+
+@app.before_request
+def setup_db():
+    # Automatically initialize tables and default accounts before processing requests
+    db.create_all()
+    if not SystemConfig.query.first():
+        db.session.add(SystemConfig(upi_id='teacher@upi'))
+    if not User.query.filter_by(email='admin@tuition.com').first():
+        admin = User(email='admin@tuition.com', password='admin123', name='Teacher Admin', role='admin')
+        db.session.add(admin)
+    db.session.commit()
 
 @app.route('/', methods=['GET', 'POST'])
 def login():
@@ -305,7 +319,6 @@ def login():
             if user.role == 'admin':
                 return redirect(url_for('admin_dashboard'))
             
-            # Ensure the student has at least one initial fee record if missing
             if not user.fee_records:
                 curr_month = datetime.now().strftime('%B %Y')
                 rec = FeeRecord(user_id=user.id, month=curr_month, amount=user.monthly_fee, is_paid=False)
@@ -323,7 +336,6 @@ def student_dashboard():
     if current_user.role == 'admin':
         return redirect(url_for('admin_dashboard'))
     
-    # Safely create initial record if student history is empty
     if not current_user.fee_records:
         curr_month = datetime.now().strftime('%B %Y')
         rec = FeeRecord(user_id=current_user.id, month=curr_month, amount=current_user.monthly_fee, is_paid=False)
@@ -447,16 +459,6 @@ def download_receipt(record_id):
 def logout():
     logout_user()
     return redirect(url_for('login'))
-
-# Initialize Database & Default Admin Account
-with app.app_context():
-    db.create_all()
-    if not SystemConfig.query.first():
-        db.session.add(SystemConfig(upi_id='teacher@upi'))
-    if not User.query.filter_by(email='admin@tuition.com').first():
-        admin = User(email='admin@tuition.com', password='admin123', name='Teacher Admin', role='admin')
-        db.session.add(admin)
-    db.session.commit()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
